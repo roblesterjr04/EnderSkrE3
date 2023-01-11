@@ -198,13 +198,12 @@ float Planner::mm_per_step[DISTINCT_AXES];      // (mm) Millimeters per step
   constexpr bool Planner::leveling_active;
 #endif
 
-skew_factor_t Planner::skew_factor; // Initialized by settings.load()
+#if ENABLED(SKEW_CORRECTION)
+  skew_factor_t Planner::skew_factor; // Initialized by settings.load()
+#endif
 
 #if ENABLED(AUTOTEMP)
-  celsius_t Planner::autotemp_max = 250,
-            Planner::autotemp_min = 210;
-  float Planner::autotemp_factor = 0.1f;
-  bool Planner::autotemp_enabled = false;
+  autotemp_t Planner::autotemp = { AUTOTEMP_MIN, AUTOTEMP_MAX, AUTOTEMP_FACTOR, false };
 #endif
 
 // private:
@@ -1434,8 +1433,8 @@ void Planner::check_axes_activity() {
   #if ENABLED(AUTOTEMP_PROPORTIONAL)
     void Planner::_autotemp_update_from_hotend() {
       const celsius_t target = thermalManager.degTargetHotend(active_extruder);
-      autotemp_min = target + AUTOTEMP_MIN_P;
-      autotemp_max = target + AUTOTEMP_MAX_P;
+      autotemp.min = target + AUTOTEMP_MIN_P;
+      autotemp.max = target + AUTOTEMP_MAX_P;
     }
   #endif
 
@@ -1446,8 +1445,8 @@ void Planner::check_axes_activity() {
    */
   void Planner::autotemp_update() {
     _autotemp_update_from_hotend();
-    autotemp_factor = TERN(AUTOTEMP_PROPORTIONAL, AUTOTEMP_FACTOR_P, 0);
-    autotemp_enabled = autotemp_factor != 0;
+    autotemp.factor = TERN(AUTOTEMP_PROPORTIONAL, AUTOTEMP_FACTOR_P, 0);
+    autotemp.enabled = autotemp.factor != 0;
   }
 
   /**
@@ -1457,13 +1456,13 @@ void Planner::check_axes_activity() {
   void Planner::autotemp_M104_M109() {
     _autotemp_update_from_hotend();
 
-    if (parser.seenval('S')) autotemp_min = parser.value_celsius();
-    if (parser.seenval('B')) autotemp_max = parser.value_celsius();
+    if (parser.seenval('S')) autotemp.min = parser.value_celsius();
+    if (parser.seenval('B')) autotemp.max = parser.value_celsius();
 
     // When AUTOTEMP_PROPORTIONAL is enabled, F0 disables autotemp.
     // Normally, leaving off F also disables autotemp.
-    autotemp_factor = parser.seen('F') ? parser.value_float() : TERN(AUTOTEMP_PROPORTIONAL, AUTOTEMP_FACTOR_P, 0);
-    autotemp_enabled = autotemp_factor != 0;
+    autotemp.factor = parser.seen('F') ? parser.value_float() : TERN(AUTOTEMP_PROPORTIONAL, AUTOTEMP_FACTOR_P, 0);
+    autotemp.enabled = autotemp.factor != 0;
   }
 
   /**
@@ -1474,8 +1473,8 @@ void Planner::check_axes_activity() {
   void Planner::autotemp_task() {
     static float oldt = 0.0f;
 
-    if (!autotemp_enabled) return;
-    if (thermalManager.degTargetHotend(active_extruder) < autotemp_min - 2) return; // Below the min?
+    if (!autotemp.enabled) return;
+    if (thermalManager.degTargetHotend(active_extruder) < autotemp.min - 2) return; // Below the min?
 
     float high = 0.0f;
     for (uint8_t b = block_buffer_tail; b != block_buffer_head; b = next_block_index(b)) {
@@ -1486,8 +1485,8 @@ void Planner::check_axes_activity() {
       }
     }
 
-    float t = autotemp_min + high * autotemp_factor;
-    LIMIT(t, autotemp_min, autotemp_max);
+    float t = autotemp.min + high * autotemp.factor;
+    LIMIT(t, autotemp.min, autotemp.max);
     if (t < oldt) t = t * (1.0f - (AUTOTEMP_OLDWEIGHT)) + oldt * (AUTOTEMP_OLDWEIGHT);
     oldt = t;
     thermalManager.setTargetHotend(t, active_extruder);
@@ -1722,6 +1721,13 @@ void Planner::endstop_triggered(const AxisEnum axis) {
 float Planner::triggered_position_mm(const AxisEnum axis) {
   const float result = DIFF_TERN(BACKLASH_COMPENSATION, stepper.triggered_position(axis), backlash.get_applied_steps(axis));
   return result * mm_per_step[axis];
+}
+
+bool Planner::busy() {
+  return (has_blocks_queued() || cleaning_buffer_counter
+      || TERN0(EXTERNAL_CLOSED_LOOP_CONTROLLER, CLOSED_LOOP_WAITING())
+      || TERN0(HAS_SHAPING, stepper.input_shaping_busy())
+  );
 }
 
 void Planner::finish_and_disable() {
@@ -2167,7 +2173,7 @@ bool Planner::_populate_block(
               sq(steps_dist_mm.x), + sq(steps_dist_mm.y), + sq(steps_dist_mm.z),
             + sq(steps_dist_mm.i), + sq(steps_dist_mm.j), + sq(steps_dist_mm.k),
             + sq(steps_dist_mm.u), + sq(steps_dist_mm.v), + sq(steps_dist_mm.w)
-          );
+          )
         #elif ENABLED(FOAMCUTTER_XYUV)
           #if HAS_J_AXIS
             // Special 5 axis kinematics. Return the largest distance move from either X/Y or I/J plane
@@ -2482,14 +2488,6 @@ bool Planner::_populate_block(
     }
 
   #endif // XY_FREQUENCY_LIMIT
-
-  #if ENABLED(INPUT_SHAPING)
-    const float top_freq = _MIN(float(0x7FFFFFFFL)
-                                OPTARG(HAS_SHAPING_X, stepper.get_shaping_frequency(X_AXIS))
-                                OPTARG(HAS_SHAPING_Y, stepper.get_shaping_frequency(Y_AXIS))),
-                max_factor = (top_freq * float(shaping_dividends - 3) * 2.0f) / block->nominal_rate;
-    NOMORE(speed_factor, max_factor);
-  #endif
 
   // Correct the speed
   if (speed_factor < 1.0f) {
